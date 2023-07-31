@@ -7,17 +7,14 @@
 // Using UART0 TX for MIDI Out
 
 // MIDI input GPIO pins numbers
-#define GP_IN_1 2  // Physical pin 4
-#define GP_IN_2 3  // Physical pin 5
-#define GP_IN_3 4  // Physical pin 6
-#define GP_IN_4 5  // Physical pin 7
-#define GP_IN_5 6  // Physical pin 9
-#define GP_IN_6 7  // Physical pin 10
-#define GP_IN_7 8  // Physical pin 11
-#define GP_IN_8 9  // Physical pin 12
-
-// MIDI input port number for the master clock
-#define MASTER_CLOCK_PORT 1
+#define GP_IN_0 2  // Physical pin 4
+#define GP_IN_1 3  // Physical pin 5
+#define GP_IN_2 4  // Physical pin 6
+#define GP_IN_3 5  // Physical pin 7
+#define GP_IN_4 6  // Physical pin 9
+#define GP_IN_5 7  // Physical pin 10
+#define GP_IN_6 8  // Physical pin 11
+#define GP_IN_7 9  // Physical pin 12
 
 // FIFO size
 #define FIFO_SIZE 256
@@ -33,7 +30,14 @@
 #define LED_BLINK_DURATION_ACTIVE_SENSING 50
 #define LED_BLINK_DURATION_CLOCK 50
 
+// Number of input ports
+#define NUM_INPUT_PORTS 8
+
+// Undefined port number
+#define PORT_NONE 255
+
 // Create input serial ports
+SerialPIO SerialPIO0(SerialPIO::NOPIN, GP_IN_0, FIFO_SIZE);
 SerialPIO SerialPIO1(SerialPIO::NOPIN, GP_IN_1, FIFO_SIZE);
 SerialPIO SerialPIO2(SerialPIO::NOPIN, GP_IN_2, FIFO_SIZE);
 SerialPIO SerialPIO3(SerialPIO::NOPIN, GP_IN_3, FIFO_SIZE);
@@ -41,9 +45,9 @@ SerialPIO SerialPIO4(SerialPIO::NOPIN, GP_IN_4, FIFO_SIZE);
 SerialPIO SerialPIO5(SerialPIO::NOPIN, GP_IN_5, FIFO_SIZE);
 SerialPIO SerialPIO6(SerialPIO::NOPIN, GP_IN_6, FIFO_SIZE);
 SerialPIO SerialPIO7(SerialPIO::NOPIN, GP_IN_7, FIFO_SIZE);
-SerialPIO SerialPIO8(SerialPIO::NOPIN, GP_IN_8, FIFO_SIZE);
 
 // Create MIDI instances
+MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO0, MIDI0);
 MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO1, MIDI1);
 MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO2, MIDI2);
 MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO3, MIDI3);
@@ -51,7 +55,6 @@ MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO4, MIDI4);
 MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO5, MIDI5);
 MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO6, MIDI6);
 MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO7, MIDI7);
-MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO8, MIDI8);
 MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, MIDIOUT);
 
 // Last time in ms the last MIDI message was sent
@@ -60,6 +63,12 @@ unsigned long lastSentMidiTime;
 // Time in microseconds the activity LED should turn off
 unsigned long ledOffTime;
 
+// Master clock port number (0-7 or PORT_NONE)
+uint8_t masterClockPort = PORT_NONE;
+
+// Keep track of the song position for each port
+bool hasSongPosition[NUM_INPUT_PORTS] = {};
+uint16_t songPosition[NUM_INPUT_PORTS] = {};
 
 /**
  * Register MIDI activity for the activity LED and active sensing.
@@ -104,7 +113,7 @@ void handleLedOff() {
  * @param portNumber
  */
 template<class Transport, class Settings, class Platform>
-void mergeMIDI(midi::MidiInterface<Transport, Settings, Platform>& midiIn, byte portNumber) {
+void mergeMIDI(midi::MidiInterface<Transport, Settings, Platform>& midiIn, uint8_t portNumber) {
   // Nothing to read here
   if (!midiIn.read())
     return;
@@ -114,6 +123,8 @@ void mergeMIDI(midi::MidiInterface<Transport, Settings, Platform>& midiIn, byte 
     registerMidiOutActivity(LED_BLINK_DURATION_CHANNEL);
     MIDIOUT.send(midiIn.getType(), midiIn.getData1(), midiIn.getData2(), midiIn.getChannel());
   } else {
+    uint16_t twoByteValue;
+
     // Other messages
     switch (midiIn.getType()) {
         // Real Time and 1 byte
@@ -122,6 +133,16 @@ void mergeMIDI(midi::MidiInterface<Transport, Settings, Platform>& midiIn, byte 
       case midi::Continue:
       case midi::SystemReset:
       case midi::TuneRequest:
+        // The most recent input to receive a START command will become the clock master.
+        if (midiIn.getType() == midi::Start) {
+          masterClockPort = portNumber;
+        }
+        // The most recent input to receive a CONTINUE after a Song Position Pointer = 0
+        // will become the clock master.
+        else if (midiIn.getType() == midi::Continue && hasSongPosition[portNumber] && songPosition[portNumber] == 0) {
+          masterClockPort = portNumber;
+        }
+        // Forward the real time message
         registerMidiOutActivity(LED_BLINK_DURATION_1_BYTE);
         MIDIOUT.sendRealTime(midiIn.getType());
         break;
@@ -131,8 +152,9 @@ void mergeMIDI(midi::MidiInterface<Transport, Settings, Platform>& midiIn, byte 
         break;
 
       case midi::Clock:
-        // Only forward MIDI clock from the master clock port
-        if (portNumber == MASTER_CLOCK_PORT) {
+        // Forward MIDI clock from the master clock port
+        // or forward all clock messages from all inputs if no master is set
+        if (portNumber == masterClockPort || masterClockPort == PORT_NONE) {
           registerMidiOutActivity(LED_BLINK_DURATION_CLOCK);
           MIDIOUT.sendClock();
         }
@@ -151,7 +173,11 @@ void mergeMIDI(midi::MidiInterface<Transport, Settings, Platform>& midiIn, byte 
 
       case midi::SongPosition:
         registerMidiOutActivity(LED_BLINK_DURATION_2_BYTE);
-        MIDIOUT.sendSongPosition(midiIn.getData1() | ((unsigned)midiIn.getData2() << 7));
+        twoByteValue = midiIn.getData1() | ((unsigned)midiIn.getData2() << 7);
+        MIDIOUT.sendSongPosition(twoByteValue);
+        // Keep the song position pointer
+        hasSongPosition[portNumber] = true;
+        songPosition[portNumber] = twoByteValue;
         break;
 
       case midi::TimeCodeQuarterFrame:
@@ -170,6 +196,7 @@ void mergeMIDI(midi::MidiInterface<Transport, Settings, Platform>& midiIn, byte 
  */
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
+  MIDI0.begin(MIDI_CHANNEL_OMNI);
   MIDI1.begin(MIDI_CHANNEL_OMNI);
   MIDI2.begin(MIDI_CHANNEL_OMNI);
   MIDI3.begin(MIDI_CHANNEL_OMNI);
@@ -177,8 +204,8 @@ void setup() {
   MIDI5.begin(MIDI_CHANNEL_OMNI);
   MIDI6.begin(MIDI_CHANNEL_OMNI);
   MIDI7.begin(MIDI_CHANNEL_OMNI);
-  MIDI8.begin(MIDI_CHANNEL_OMNI);
   MIDIOUT.begin(MIDI_CHANNEL_OMNI);
+  MIDI0.turnThruOff();
   MIDI1.turnThruOff();
   MIDI2.turnThruOff();
   MIDI3.turnThruOff();
@@ -186,7 +213,6 @@ void setup() {
   MIDI5.turnThruOff();
   MIDI6.turnThruOff();
   MIDI7.turnThruOff();
-  MIDI8.turnThruOff();
   MIDIOUT.turnThruOff();
 }
 
@@ -194,6 +220,7 @@ void setup() {
  * Main loop
  */
 void loop() {
+  mergeMIDI(MIDI0, 0);
   mergeMIDI(MIDI1, 1);
   mergeMIDI(MIDI2, 2);
   mergeMIDI(MIDI3, 3);
@@ -201,7 +228,6 @@ void loop() {
   mergeMIDI(MIDI5, 5);
   mergeMIDI(MIDI6, 6);
   mergeMIDI(MIDI7, 7);
-  mergeMIDI(MIDI8, 8);
   sendActiveSensing();
   handleLedOff();
 }
