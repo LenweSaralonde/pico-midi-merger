@@ -19,8 +19,8 @@
 // FIFO size
 #define FIFO_SIZE 256
 
-// Active sensing delay in ms
-#define ACTIVE_SENSING_DELAY 300
+// Active sensing timeout in ms
+#define ACTIVE_SENSING_TIMEOUT 5000
 
 // Activity LED durations for MIDI out in microseconds
 #define LED_BLINK_DURATION_CHANNEL 960
@@ -57,39 +57,40 @@ MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO6, MIDI6);
 MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO7, MIDI7);
 MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, MIDIOUT);
 
-// Last time in ms the last MIDI message was sent
-unsigned long lastSentMidiTime;
-
 // Time in microseconds the activity LED should turn off
 unsigned long ledOffTime;
 
 // Master clock port number (0-7 or PORT_NONE)
 uint8_t masterClockPort = PORT_NONE;
 
+// Master active sensing port number (0-7 or PORT_NONE)
+uint8_t activeSensingPort = PORT_NONE;
+
+// Last time in ms the last active sensing message was received
+unsigned long lastActiveSensingTime;
+
 // Keep track of the song position for each port
 bool hasSongPosition[NUM_INPUT_PORTS] = {};
 uint16_t songPosition[NUM_INPUT_PORTS] = {};
 
 /**
- * Register MIDI activity for the activity LED and active sensing.
+ * Register MIDI activity for the activity LED.
  * @param ledBlinkDuration Duration in microseconds to keep the activity LED on
  */
 void registerMidiOutActivity(unsigned int ledBlinkDuration) {
-  lastSentMidiTime = millis();
   digitalWrite(LED_BUILTIN, HIGH);
   ledOffTime = max(ledOffTime, micros() + ledBlinkDuration);
 }
 
 /**
- * Send active sensing message if no MIDI message has been sent after the fixed delay.
+ * Time out the master active sensing port if no AS message has been received during the timeout period.
  */
-void sendActiveSensing() {
+void handleActiveSensingTimeout() {
   unsigned long now = millis();
-  if (now > lastSentMidiTime + ACTIVE_SENSING_DELAY) {
-    registerMidiOutActivity(LED_BLINK_DURATION_ACTIVE_SENSING);
-    MIDIOUT.sendActiveSensing();
-  } else if (now < lastSentMidiTime) {  // The millis() counter has reset
-    lastSentMidiTime = now;
+  if (activeSensingPort != PORT_NONE && lastActiveSensingTime + ACTIVE_SENSING_TIMEOUT < now) {
+    activeSensingPort = PORT_NONE;
+  } else if (now < lastActiveSensingTime) {  // The millis() counter has reset
+    lastActiveSensingTime = 0;
   }
 }
 
@@ -148,7 +149,18 @@ void mergeMIDI(midi::MidiInterface<Transport, Settings, Platform>& midiIn, uint8
         break;
 
       case midi::ActiveSensing:
-        // Ignore incoming active sensing messages
+        // Set the master active sensing port if none is already set
+        if (activeSensingPort == PORT_NONE) {
+          activeSensingPort = portNumber;
+        }
+
+        // Forward active sensing messages from the master port only
+        if (portNumber == activeSensingPort) {
+          lastActiveSensingTime = millis();
+          registerMidiOutActivity(LED_BLINK_DURATION_ACTIVE_SENSING);
+          MIDIOUT.sendActiveSensing();
+        }
+
         break;
 
       case midi::Clock:
@@ -228,6 +240,6 @@ void loop() {
   mergeMIDI(MIDI5, 5);
   mergeMIDI(MIDI6, 6);
   mergeMIDI(MIDI7, 7);
-  sendActiveSensing();
+  handleActiveSensingTimeout();
   handleLedOff();
 }
