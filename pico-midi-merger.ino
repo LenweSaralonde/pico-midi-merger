@@ -6,7 +6,7 @@
 
 // Using UART0 TX for MIDI Out
 
-// GPIO MIDI In pins
+// MIDI input GPIO pins numbers
 #define GP_IN_1 2  // Physical pin 4
 #define GP_IN_2 3  // Physical pin 5
 #define GP_IN_3 4  // Physical pin 6
@@ -16,8 +16,22 @@
 #define GP_IN_7 8  // Physical pin 11
 #define GP_IN_8 9  // Physical pin 12
 
+// MIDI input port number for the master clock
+#define MASTER_CLOCK_PORT 1
+
 // FIFO size
 #define FIFO_SIZE 256
+
+// Active sensing delay in ms
+#define ACTIVE_SENSING_DELAY 300
+
+// Activity LED durations for MIDI out in microseconds
+#define LED_BLINK_DURATION_CHANNEL 960
+#define LED_BLINK_DURATION_1_BYTE 320
+#define LED_BLINK_DURATION_2_BYTE 640
+#define LED_BLINK_DURATION_3_BYTE 960
+#define LED_BLINK_DURATION_ACTIVE_SENSING 50
+#define LED_BLINK_DURATION_CLOCK 50
 
 // Create input serial ports
 SerialPIO SerialPIO1(SerialPIO::NOPIN, GP_IN_1, FIFO_SIZE);
@@ -40,20 +54,114 @@ MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO7, MIDI7);
 MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO8, MIDI8);
 MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, MIDIOUT);
 
+// Last time in ms the last MIDI message was sent
+unsigned long lastSentMidiTime;
+
+// Time in microseconds the activity LED should turn off
+unsigned long ledOffTime;
+
+
 /**
- * Forwards the MIDI message to MIDIOUT
- * @param type
- * @param channel
- * @param data1
- * @param data2
- * @param sysExArray
+ * Register MIDI activity for the activity LED and active sensing.
+ * @param ledBlinkDuration Duration in microseconds to keep the activity LED on
  */
-void forwardMIDI(midi::MidiType type, byte channel, byte data1, byte data2, const byte* sysExArray) {
-  if (type != midi::SystemExclusive) {
-    MIDIOUT.send(type, data1, data2, channel);
+void registerMidiOutActivity(unsigned int ledBlinkDuration) {
+  lastSentMidiTime = millis();
+  digitalWrite(LED_BUILTIN, HIGH);
+  ledOffTime = max(ledOffTime, micros() + ledBlinkDuration);
+}
+
+/**
+ * Send active sensing message if no MIDI message has been sent after the fixed delay.
+ */
+void sendActiveSensing() {
+  unsigned long now = millis();
+  if (now > lastSentMidiTime + ACTIVE_SENSING_DELAY) {
+    registerMidiOutActivity(LED_BLINK_DURATION_ACTIVE_SENSING);
+    MIDIOUT.sendActiveSensing();
+  } else if (now < lastSentMidiTime) {  // The millis() counter has reset
+    lastSentMidiTime = now;
+  }
+}
+
+/**
+ * Turn the activity LED off if the delay has expired.
+ */
+void handleLedOff() {
+  unsigned long now = micros();
+  if (now >= ledOffTime) {
+    digitalWrite(LED_BUILTIN, LOW);
+  } else if (ledOffTime - now > 1000000) {  // The micros() counter has reset
+    ledOffTime = 0;
+    digitalWrite(LED_BUILTIN, LOW);
+  }
+}
+
+/**
+ * Read and forward incoming MIDI messages from midiInInstance to MIDIOUT.
+ * Based on the MidiInterface::thruFilter() function.
+ * @param midiIn
+ * @param portNumber
+ */
+template<class Transport, class Settings, class Platform>
+void mergeMIDI(midi::MidiInterface<Transport, Settings, Platform>& midiIn, byte portNumber) {
+  // Nothing to read here
+  if (!midiIn.read())
+    return;
+
+  // Channel messages
+  if (midiIn.getType() >= midi::NoteOff && midiIn.getType() <= midi::PitchBend) {
+    registerMidiOutActivity(LED_BLINK_DURATION_CHANNEL);
+    MIDIOUT.send(midiIn.getType(), midiIn.getData1(), midiIn.getData2(), midiIn.getChannel());
   } else {
-    int sysExLen = data1 + 256 * data2;
-    MIDIOUT.sendSysEx(sysExLen, sysExArray, true);
+    // Other messages
+    switch (midiIn.getType()) {
+        // Real Time and 1 byte
+      case midi::Start:
+      case midi::Stop:
+      case midi::Continue:
+      case midi::SystemReset:
+      case midi::TuneRequest:
+        registerMidiOutActivity(LED_BLINK_DURATION_1_BYTE);
+        MIDIOUT.sendRealTime(midiIn.getType());
+        break;
+
+      case midi::ActiveSensing:
+        // Ignore incoming active sensing messages
+        break;
+
+      case midi::Clock:
+        // Only forward MIDI clock from the master clock port
+        if (portNumber == MASTER_CLOCK_PORT) {
+          registerMidiOutActivity(LED_BLINK_DURATION_CLOCK);
+          MIDIOUT.sendClock();
+        }
+        break;
+
+      case midi::SystemExclusive:
+        // Send SysEx (0xf0 and 0xf7 are included in the buffer)
+        registerMidiOutActivity(midiIn.getSysExArrayLength() * LED_BLINK_DURATION_1_BYTE);
+        MIDIOUT.sendSysEx(midiIn.getSysExArrayLength(), midiIn.getSysExArray(), true);
+        break;
+
+      case midi::SongSelect:
+        registerMidiOutActivity(LED_BLINK_DURATION_2_BYTE);
+        MIDIOUT.sendSongSelect(midiIn.getData1());
+        break;
+
+      case midi::SongPosition:
+        registerMidiOutActivity(LED_BLINK_DURATION_2_BYTE);
+        MIDIOUT.sendSongPosition(midiIn.getData1() | ((unsigned)midiIn.getData2() << 7));
+        break;
+
+      case midi::TimeCodeQuarterFrame:
+        registerMidiOutActivity(LED_BLINK_DURATION_3_BYTE);
+        MIDIOUT.sendTimeCodeQuarterFrame(midiIn.getData1(), midiIn.getData2());
+        break;
+
+      default:
+        break;  // LCOV_EXCL_LINE - Unreacheable code, but prevents unhandled case warning.
+    }
   }
 }
 
@@ -61,6 +169,7 @@ void forwardMIDI(midi::MidiType type, byte channel, byte data1, byte data2, cons
  * Inintialize
  */
 void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
   MIDI1.begin(MIDI_CHANNEL_OMNI);
   MIDI2.begin(MIDI_CHANNEL_OMNI);
   MIDI3.begin(MIDI_CHANNEL_OMNI);
@@ -85,28 +194,14 @@ void setup() {
  * Main loop
  */
 void loop() {
-  if (MIDI1.read()) {
-    forwardMIDI(MIDI1.getType(), MIDI1.getChannel(), MIDI1.getData1(), MIDI1.getData2(), MIDI1.getSysExArray());
-  }
-  if (MIDI2.read()) {
-    forwardMIDI(MIDI2.getType(), MIDI2.getChannel(), MIDI2.getData1(), MIDI2.getData2(), MIDI2.getSysExArray());
-  }
-  if (MIDI3.read()) {
-    forwardMIDI(MIDI3.getType(), MIDI3.getChannel(), MIDI3.getData1(), MIDI3.getData2(), MIDI3.getSysExArray());
-  }
-  if (MIDI4.read()) {
-    forwardMIDI(MIDI4.getType(), MIDI4.getChannel(), MIDI4.getData1(), MIDI4.getData2(), MIDI4.getSysExArray());
-  }
-  if (MIDI5.read()) {
-    forwardMIDI(MIDI5.getType(), MIDI5.getChannel(), MIDI5.getData1(), MIDI5.getData2(), MIDI5.getSysExArray());
-  }
-  if (MIDI6.read()) {
-    forwardMIDI(MIDI6.getType(), MIDI6.getChannel(), MIDI6.getData1(), MIDI6.getData2(), MIDI6.getSysExArray());
-  }
-  if (MIDI7.read()) {
-    forwardMIDI(MIDI7.getType(), MIDI7.getChannel(), MIDI7.getData1(), MIDI7.getData2(), MIDI7.getSysExArray());
-  }
-  if (MIDI8.read()) {
-    forwardMIDI(MIDI8.getType(), MIDI8.getChannel(), MIDI8.getData1(), MIDI8.getData2(), MIDI8.getSysExArray());
-  }
+  mergeMIDI(MIDI1, 1);
+  mergeMIDI(MIDI2, 2);
+  mergeMIDI(MIDI3, 3);
+  mergeMIDI(MIDI4, 4);
+  mergeMIDI(MIDI5, 5);
+  mergeMIDI(MIDI6, 6);
+  mergeMIDI(MIDI7, 7);
+  mergeMIDI(MIDI8, 8);
+  sendActiveSensing();
+  handleLedOff();
 }
