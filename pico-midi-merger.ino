@@ -2,8 +2,6 @@
  * 8-port MIDI Merger for Raspberry Pi Pico
  */
 
-#include <MIDI.h>
-
 // Using UART0 TX for MIDI Out
 
 // MIDI input GPIO pins numbers
@@ -19,16 +17,17 @@
 // FIFO size
 #define FIFO_SIZE 256
 
+// MIDI baud rate
+#define MIDI_BAUD_RATE 31250
+
+// MIDI receive timeout in microseconds
+#define MIDI_RECEIVE_TIMEOUT 640
+
+// Duration in microseconds the activity LED remains on after sending a data byte
+#define ACTIVITY_LED_DURATION 320
+
 // Active sensing timeout in ms
 #define ACTIVE_SENSING_TIMEOUT 5000
-
-// Activity LED durations for MIDI out in microseconds
-#define LED_BLINK_DURATION_CHANNEL 960
-#define LED_BLINK_DURATION_1_BYTE 320
-#define LED_BLINK_DURATION_2_BYTE 640
-#define LED_BLINK_DURATION_3_BYTE 960
-#define LED_BLINK_DURATION_ACTIVE_SENSING 50
-#define LED_BLINK_DURATION_CLOCK 50
 
 // Number of input ports
 #define NUM_INPUT_PORTS 8
@@ -46,19 +45,20 @@ SerialPIO SerialPIO5(SerialPIO::NOPIN, GP_IN_5, FIFO_SIZE);
 SerialPIO SerialPIO6(SerialPIO::NOPIN, GP_IN_6, FIFO_SIZE);
 SerialPIO SerialPIO7(SerialPIO::NOPIN, GP_IN_7, FIFO_SIZE);
 
-// Create MIDI instances
-MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO0, MIDI0);
-MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO1, MIDI1);
-MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO2, MIDI2);
-MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO3, MIDI3);
-MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO4, MIDI4);
-MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO5, MIDI5);
-MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO6, MIDI6);
-MIDI_CREATE_INSTANCE(SerialPIO, SerialPIO7, MIDI7);
-MIDI_CREATE_INSTANCE(HardwareSerial, Serial1, MIDIOUT);
+// Next bytes for each port
+int nextByte[NUM_INPUT_PORTS] = {};
 
-// Time in microseconds the activity LED should turn off
-unsigned long ledOffTime;
+// Running statuses
+uint8_t runningStatus[NUM_INPUT_PORTS] = {};
+
+// Last sent MIDI message type
+uint8_t lastSentStatusByte = 0x00;
+
+// Activity LED is on or off
+bool isActivityLedOn = false;
+
+// Time in microseconds the last data byte was sent to MIDI out
+unsigned long lastSentDataByteMicros;
 
 // Master clock port number (0-7 or PORT_NONE)
 uint8_t masterClockPort = PORT_NONE;
@@ -66,180 +66,380 @@ uint8_t masterClockPort = PORT_NONE;
 // Master active sensing port number (0-7 or PORT_NONE)
 uint8_t activeSensingPort = PORT_NONE;
 
-// Last time in ms the last active sensing message was received
-unsigned long lastActiveSensingTime;
+// Last time in ms the last active sensing message was received from the active sensing port
+unsigned long lastReceivedActiveSensingMillis;
 
-// Keep track of the song position for each port
-bool hasSongPosition[NUM_INPUT_PORTS] = {};
-uint16_t songPosition[NUM_INPUT_PORTS] = {};
+// Keep track of the song position bytes for each port
+uint8_t songPosition[NUM_INPUT_PORTS][2] = {};
 
 /**
- * Register MIDI activity for the activity LED.
- * @param ledBlinkDuration Duration in microseconds to keep the activity LED on
+ * Get the serial port instance for the port number
+ * @param portNumber
+ * @return SerialPIO instance
  */
-void registerMidiOutActivity(unsigned int ledBlinkDuration) {
-  digitalWrite(LED_BUILTIN, HIGH);
-  ledOffTime = max(ledOffTime, micros() + ledBlinkDuration);
+SerialPIO& getPort(uint8_t portNumber) {
+  switch (portNumber) {
+    case 0: return SerialPIO0; break;
+    case 1: return SerialPIO1; break;
+    case 2: return SerialPIO2; break;
+    case 3: return SerialPIO3; break;
+    case 4: return SerialPIO4; break;
+    case 5: return SerialPIO5; break;
+    case 6: return SerialPIO6; break;
+    case 7: return SerialPIO7; break;
+    default: return SerialPIO0; break;
+  }
 }
 
 /**
- * Time out the master active sensing port if no AS message has been received during the timeout period.
+ * Read data byte from the port number
+ * @param portNumber
+ * @return the read byte or -1 if none
+ */
+int read(uint8_t portNumber) {
+  // We already have read the next byte: return it
+  if (nextByte[portNumber] >= 0) {
+    int dataByte = nextByte[portNumber];
+    nextByte[portNumber] = -1;
+    return dataByte;
+  }
+  // Read new data byte from buffer
+  return getPort(portNumber).read();
+}
+
+/**
+ * Return the next data byte from the port number
+ * @param portNumber
+ * @return the next byte or -1 if none
+ */
+int next(uint8_t portNumber) {
+  if (nextByte[portNumber] < 0) {
+    nextByte[portNumber] = getPort(portNumber).read();
+  }
+  return nextByte[portNumber];
+}
+
+/**
+ * Return available bytes for the port number
+ * @param portNumber
+ * @return number of bytes in the buffer
+ */
+uint8_t available(uint8_t portNumber) {
+  return getPort(portNumber).available() + (nextByte[portNumber] >= 0 ? 1 : 0);
+}
+
+/**
+ * Time out the master active sensing port if no AS message has been received during the timeout period
  */
 void handleActiveSensingTimeout() {
-  unsigned long now = millis();
-  if (activeSensingPort != PORT_NONE && lastActiveSensingTime + ACTIVE_SENSING_TIMEOUT < now) {
+  if (activeSensingPort != PORT_NONE && millis() - lastReceivedActiveSensingMillis > ACTIVE_SENSING_TIMEOUT) {
     activeSensingPort = PORT_NONE;
-  } else if (now < lastActiveSensingTime) {  // The millis() counter has reset
-    lastActiveSensingTime = 0;
   }
+}
+
+/**
+ * Indicates if the data byte is a status byte
+ * @param dataByte
+ * @return is status byte
+ */
+bool isStatusByte(int dataByte) {
+  return dataByte >= 0x80;
+}
+
+/**
+ * Indicates if the status byte is for a channel message
+ * @param statusByte
+ * @return is channel message
+ */
+bool isChannelMessageType(int statusByte) {
+  return statusByte >= 0x80 && statusByte <= 0xEF;
+}
+
+/**
+ * Indicates if the status byte is for a real-time message
+ * @param statusByte
+ * @return is real-time
+ */
+bool isRealTimeMessageType(int statusByte) {
+  return statusByte >= 0xF8;
+}
+
+/**
+ * Indicates if the status byte is for a system exclusive message
+ * @param statusByte
+ * @return is system exclusive
+ */
+bool isSystemExclusive(int statusByte) {
+  return statusByte == 0xF0 || statusByte == 0xF7;  // System Exclusive Start or System Exclusive End
+}
+
+/**
+ * Get the MIDI message length in bytes, including the status byte.
+ * @param statusByte
+ * @return message length or 0 if it can't be determined (SysEx)
+ */
+uint8_t getMessageLength(uint8_t statusByte) {
+  // 1 byte messages
+  if (
+    statusByte == 0xF4 ||  // (Undefined)
+    statusByte == 0xF5 ||  // (Undefined)
+    statusByte == 0xF6 ||  // TuneRequest
+    statusByte == 0xF8 ||  // Clock
+    statusByte == 0xF9 ||  // Tick
+    statusByte == 0xFA ||  // Start
+    statusByte == 0xFB ||  // Continue
+    statusByte == 0xFC ||  // Stop
+    statusByte == 0xFD ||  // (Undefined)
+    statusByte == 0xFE ||  // ActiveSensing
+    statusByte == 0xFF     // SystemReset)
+  ) {
+    return 1;
+  }
+
+  // 2 bytes messages
+  if (
+    statusByte >= 0xC0 && statusByte <= 0xCF ||  // ProgramChange
+    statusByte >= 0xD0 && statusByte <= 0xDF ||  // AfterTouchChannel
+    statusByte == 0xF1 ||                        // TimeCodeQuarterFrame
+    statusByte == 0xF3                           // SongSelect
+  ) {
+    return 2;
+  }
+
+  // 3 bytes messages
+  if (
+    statusByte >= 0x90 && statusByte <= 0x9F ||  // NoteOn
+    statusByte >= 0x80 && statusByte <= 0x8F ||  // NoteOff
+    statusByte >= 0xA0 && statusByte <= 0xAF ||  // AfterTouchPoly
+    statusByte >= 0xB0 && statusByte <= 0xBF ||  // ControlChange
+    statusByte >= 0xE0 && statusByte <= 0xEF ||  // PitchBend
+    statusByte == 0xF2                           // SongPosition
+  ) {
+    return 3;
+  }
+
+  // Undefined length
+  return 0;
 }
 
 /**
  * Turn the activity LED off if the delay has expired.
  */
 void handleLedOff() {
-  unsigned long now = micros();
-  if (now >= ledOffTime) {
-    digitalWrite(LED_BUILTIN, LOW);
-  } else if (ledOffTime - now > 1000000) {  // The micros() counter has reset
-    ledOffTime = 0;
+  if (isActivityLedOn && micros() - lastSentDataByteMicros > ACTIVITY_LED_DURATION) {
+    isActivityLedOn = false;
     digitalWrite(LED_BUILTIN, LOW);
   }
 }
 
 /**
- * Read and forward incoming MIDI messages from midiInInstance to MIDIOUT.
- * Based on the MidiInterface::thruFilter() function.
- * @param midiIn
+ * Send a data byte to MIDI out
+ * @param dataByte
+ */
+void sendDataByte(uint8_t dataByte) {
+  // Turn the activity LED on
+  digitalWrite(LED_BUILTIN, HIGH);
+  isActivityLedOn = true;
+  // Send byte
+  Serial1.write(dataByte);
+  lastSentDataByteMicros = micros();
+}
+
+/**
+ * Send status byte from provided port number to MIDI out, if applicable
+ * @param statusByte
  * @param portNumber
  */
-template<class Transport, class Settings, class Platform>
-void mergeMIDI(midi::MidiInterface<Transport, Settings, Platform>& midiIn, uint8_t portNumber) {
-  // Nothing to read here
-  if (!midiIn.read())
+void sendStatusByte(uint8_t statusByte, uint8_t portNumber) {
+  // Attempting to send a master clock message while not being the master clock
+  if (statusByte == 0xF8 && portNumber != masterClockPort) {
     return;
+  }
 
-  // Channel messages
-  if (midiIn.getType() >= midi::NoteOff && midiIn.getType() <= midi::PitchBend) {
-    registerMidiOutActivity(LED_BLINK_DURATION_CHANNEL);
-    MIDIOUT.send(midiIn.getType(), midiIn.getData1(), midiIn.getData2(), midiIn.getChannel());
-  } else {
-    uint16_t twoByteValue;
+  // Attempting to send an active sensing while not being the master AS port
+  if (statusByte == 0xFE && portNumber != activeSensingPort) {
+    return;
+  }
 
-    // Other messages
-    switch (midiIn.getType()) {
-        // Real Time and 1 byte
-      case midi::Start:
-      case midi::Stop:
-      case midi::Continue:
-      case midi::SystemReset:
-      case midi::TuneRequest:
-        // The most recent input to receive a START command will become the clock master.
-        if (midiIn.getType() == midi::Start) {
-          masterClockPort = portNumber;
-        }
-        // The most recent input to receive a CONTINUE after a Song Position Pointer = 0
-        // will become the clock master.
-        else if (midiIn.getType() == midi::Continue && hasSongPosition[portNumber] && songPosition[portNumber] == 0) {
-          masterClockPort = portNumber;
-        }
-        // Forward the real time message
-        registerMidiOutActivity(LED_BLINK_DURATION_1_BYTE);
-        MIDIOUT.sendRealTime(midiIn.getType());
-        break;
+  // Do not send the status byte if there is an outgoing running status
+  if (isChannelMessageType(statusByte) && statusByte == lastSentStatusByte) {
+    return;
+  }
 
-      case midi::ActiveSensing:
-        // Set the master active sensing port if none is already set
-        if (activeSensingPort == PORT_NONE) {
-          activeSensingPort = portNumber;
-        }
+  // Send status byte to MIDI out
+  sendDataByte(statusByte);
+  lastSentStatusByte = statusByte;
+}
 
-        // Forward active sensing messages from the master port only
-        if (portNumber == activeSensingPort) {
-          lastActiveSensingTime = millis();
-          registerMidiOutActivity(LED_BLINK_DURATION_ACTIVE_SENSING);
-          MIDIOUT.sendActiveSensing();
-        }
-
-        break;
-
-      case midi::Clock:
-        // Forward MIDI clock from the master clock port
-        // or forward all clock messages from all inputs if no master is set
-        if (portNumber == masterClockPort || masterClockPort == PORT_NONE) {
-          registerMidiOutActivity(LED_BLINK_DURATION_CLOCK);
-          MIDIOUT.sendClock();
-        }
-        break;
-
-      case midi::SystemExclusive:
-        // Send SysEx (0xf0 and 0xf7 are included in the buffer)
-        registerMidiOutActivity(midiIn.getSysExArrayLength() * LED_BLINK_DURATION_1_BYTE);
-        MIDIOUT.sendSysEx(midiIn.getSysExArrayLength(), midiIn.getSysExArray(), true);
-        break;
-
-      case midi::SongSelect:
-        registerMidiOutActivity(LED_BLINK_DURATION_2_BYTE);
-        MIDIOUT.sendSongSelect(midiIn.getData1());
-        break;
-
-      case midi::SongPosition:
-        registerMidiOutActivity(LED_BLINK_DURATION_2_BYTE);
-        twoByteValue = midiIn.getData1() | ((unsigned)midiIn.getData2() << 7);
-        MIDIOUT.sendSongPosition(twoByteValue);
-        // Keep the song position pointer
-        hasSongPosition[portNumber] = true;
-        songPosition[portNumber] = twoByteValue;
-        break;
-
-      case midi::TimeCodeQuarterFrame:
-        registerMidiOutActivity(LED_BLINK_DURATION_3_BYTE);
-        MIDIOUT.sendTimeCodeQuarterFrame(midiIn.getData1(), midiIn.getData2());
-        break;
-
-      default:
-        break;  // LCOV_EXCL_LINE - Unreacheable code, but prevents unhandled case warning.
+/**
+ * Process real-time message to determine the master clock and/or master active sensing port
+ * @param statusByte
+ * @param portNumber
+ */
+void processRealTimeMessage(uint8_t statusByte, uint8_t portNumber) {
+  // Song start or song continue with position set to 0 received: set port number as master clock
+  if (statusByte == 0xFA || statusByte == 0xFB && songPosition[portNumber][0] == 0x00 && songPosition[portNumber][1] == 0x00) {
+    masterClockPort = portNumber;
+  }
+  // Active sensing
+  else if (statusByte == 0xFE) {
+    // Set AS port if undefined
+    if (activeSensingPort == PORT_NONE) {
+      activeSensingPort = portNumber;
+      lastReceivedActiveSensingMillis = millis();
+    }
+    // Otherwise, update the last encountered AS message timestamp
+    else if (activeSensingPort == portNumber) {
+      lastReceivedActiveSensingMillis = millis();
     }
   }
 }
 
 /**
- * Inintialize
+ * Forward real-time messages pending from all the input ports
+ */
+void mergeRealTimeMessages() {
+  for (byte portNumber = 0; portNumber < NUM_INPUT_PORTS; portNumber++) {
+    while (isRealTimeMessageType(next(portNumber))) {
+      int dataByte = read(portNumber);
+      processRealTimeMessage(dataByte, portNumber);
+      sendStatusByte(dataByte, portNumber);
+    }
+  }
+}
+
+/**
+ * Merge incoming MIDI message for provided port number
+ * @param portNumber
+ */
+void mergeMIDI(uint8_t portNumber) {
+  // Nothing to read here
+  if (available(portNumber) == 0)
+    return;
+
+  // Determine the type of message based on the first data byte
+  uint8_t nextByte = next(portNumber);
+
+  // Get and send status byte
+  uint8_t statusByte;
+
+  // It's a proper status byte
+  if (isStatusByte(nextByte)) {
+    statusByte = nextByte;
+    sendStatusByte(read(portNumber), portNumber);
+    processRealTimeMessage(statusByte, portNumber);
+  }
+  // Check if we have a valid running status for this port,
+  // in this case we're reading the first data byte
+  else if (runningStatus[portNumber] != 0x00) {
+    statusByte = runningStatus[portNumber];
+    sendStatusByte(statusByte, portNumber);
+  }
+  // This is an error: ignore it
+  else {
+    read(portNumber);
+    return;
+  }
+
+  // Determine the number of bytes left or if it's a SysEx
+  uint8_t messageLength = getMessageLength(statusByte);
+  bool isSysEx = isSystemExclusive(statusByte);
+  uint8_t bytesLeft = (!isSysEx && messageLength > 1) ? messageLength - 1 : 0;
+
+  // Store running status for channel messages
+  if (isChannelMessageType(statusByte)) {
+    runningStatus[portNumber] = statusByte;
+  }
+  // Reset running status
+  else if (!isRealTimeMessageType(statusByte)) {
+    runningStatus[portNumber] = 0x00;
+  }
+
+  // Forward the message data to MIDI out
+  unsigned int lastReceivedTime = micros();
+  while (bytesLeft > 0 || isSysEx) {
+    // Handle timeout
+    if (micros() - lastReceivedTime > MIDI_RECEIVE_TIMEOUT) {
+      break;
+    }
+
+    // Interleave real-time messages
+    mergeRealTimeMessages();
+
+    // There is some data to read
+    uint8_t dataByte;
+    if (available(portNumber) > 0) {
+
+      // Read and forward data byte
+      dataByte = read(portNumber);
+      sendDataByte(dataByte);
+      lastReceivedTime = micros();
+
+      // If was not a real-time message
+      if (!isRealTimeMessageType(dataByte)) {
+
+        // Keep track of the song position to determine the master clock port
+        if (statusByte == 0xF2) {
+          if (bytesLeft == 2) {
+            songPosition[portNumber][0] = dataByte;
+          } else if (bytesLeft == 1) {
+            songPosition[portNumber][1] = dataByte;
+          }
+        }
+
+        // One byte less to read
+        if (!isSysEx) {
+          bytesLeft--;
+        }
+        // End of SysEx message
+        else if (dataByte == 0xF7) {
+          isSysEx = false;
+        }
+      } else {
+        processRealTimeMessage(dataByte, portNumber);
+      }
+    } else {
+      handleLedOff();
+    }
+  }
+}
+
+/**
+ * Reset merger
+ */
+void reset() {
+  digitalWrite(LED_BUILTIN, LOW);
+  isActivityLedOn = false;
+  lastSentStatusByte = 0x00;
+  masterClockPort = PORT_NONE;
+  activeSensingPort = PORT_NONE;
+  for (byte portNumber = 0; portNumber < NUM_INPUT_PORTS; portNumber++) {
+    nextByte[portNumber] = -1;
+    runningStatus[portNumber] = 0x00;
+    songPosition[portNumber][0] = 0xFF;
+    songPosition[portNumber][1] = 0xFF;
+  }
+}
+
+/**
+ * Initialize
  */
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
-  MIDI0.begin(MIDI_CHANNEL_OMNI);
-  MIDI1.begin(MIDI_CHANNEL_OMNI);
-  MIDI2.begin(MIDI_CHANNEL_OMNI);
-  MIDI3.begin(MIDI_CHANNEL_OMNI);
-  MIDI4.begin(MIDI_CHANNEL_OMNI);
-  MIDI5.begin(MIDI_CHANNEL_OMNI);
-  MIDI6.begin(MIDI_CHANNEL_OMNI);
-  MIDI7.begin(MIDI_CHANNEL_OMNI);
-  MIDIOUT.begin(MIDI_CHANNEL_OMNI);
-  MIDI0.turnThruOff();
-  MIDI1.turnThruOff();
-  MIDI2.turnThruOff();
-  MIDI3.turnThruOff();
-  MIDI4.turnThruOff();
-  MIDI5.turnThruOff();
-  MIDI6.turnThruOff();
-  MIDI7.turnThruOff();
-  MIDIOUT.turnThruOff();
+  Serial1.begin(MIDI_BAUD_RATE);
+  for (byte portNumber = 0; portNumber < NUM_INPUT_PORTS; portNumber++) {
+    getPort(portNumber).begin(MIDI_BAUD_RATE);
+  }
+  reset();
 }
 
 /**
  * Main loop
  */
 void loop() {
-  mergeMIDI(MIDI0, 0);
-  mergeMIDI(MIDI1, 1);
-  mergeMIDI(MIDI2, 2);
-  mergeMIDI(MIDI3, 3);
-  mergeMIDI(MIDI4, 4);
-  mergeMIDI(MIDI5, 5);
-  mergeMIDI(MIDI6, 6);
-  mergeMIDI(MIDI7, 7);
+  for (byte portNumber = 0; portNumber < NUM_INPUT_PORTS; portNumber++) {
+    mergeMIDI(portNumber);
+  }
   handleActiveSensingTimeout();
   handleLedOff();
 }
