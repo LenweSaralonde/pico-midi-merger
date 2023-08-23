@@ -45,8 +45,10 @@ SerialPIO SerialPIO5(SerialPIO::NOPIN, GP_IN_5, FIFO_SIZE);
 SerialPIO SerialPIO6(SerialPIO::NOPIN, GP_IN_6, FIFO_SIZE);
 SerialPIO SerialPIO7(SerialPIO::NOPIN, GP_IN_7, FIFO_SIZE);
 
-// Next bytes for each port
-int nextByte[NUM_INPUT_PORTS] = {};
+// FIFO buffers for each port
+int buffer[NUM_INPUT_PORTS][FIFO_SIZE] = {};
+int bufferStartIndex[NUM_INPUT_PORTS] = {};
+int bufferSize[NUM_INPUT_PORTS] = {};
 
 // Running statuses
 uint8_t runningStatus[NUM_INPUT_PORTS] = {};
@@ -92,40 +94,76 @@ SerialPIO& getPort(uint8_t portNumber) {
 }
 
 /**
- * Read data byte from the port number
+ * Read the MIDI data from the serial port and store it into the port buffer
  * @param portNumber
- * @return the read byte or -1 if none
  */
-int read(uint8_t portNumber) {
-  // We already have read the next byte: return it
-  if (nextByte[portNumber] >= 0) {
-    int dataByte = nextByte[portNumber];
-    nextByte[portNumber] = -1;
-    return dataByte;
+void readMIDI(uint8_t portNumber) {
+  int& startIndex = bufferStartIndex[portNumber];
+  int& size = bufferSize[portNumber];
+
+  // Adjust the start index and size to the first valid byte
+  // in case some deleted bytes are encountered as the beginning of the buffer.
+  while (size > 0 && buffer[portNumber][startIndex] == -1) {
+    startIndex = (startIndex + 1) % FIFO_SIZE;
+    size--;
   }
-  // Read new data byte from buffer
-  return getPort(portNumber).read();
+
+  // Read the incoming data from the serial port and store it into the FIFO buffer.
+  while (getPort(portNumber).available() > 0) {
+    int byte = getPort(portNumber).read();
+    if (size < FIFO_SIZE - 1) {
+      buffer[portNumber][(startIndex + size) % FIFO_SIZE] = byte;
+      size++;
+    }
+  }
 }
 
 /**
- * Return the next data byte from the port number
- * @param portNumber
- * @return the next byte or -1 if none
- */
-int next(uint8_t portNumber) {
-  if (nextByte[portNumber] < 0) {
-    nextByte[portNumber] = getPort(portNumber).read();
-  }
-  return nextByte[portNumber];
-}
-
-/**
- * Return available bytes for the port number
+ * Return the available bytes for the port number
  * @param portNumber
  * @return number of bytes in the buffer
  */
 uint8_t available(uint8_t portNumber) {
-  return getPort(portNumber).available() + (nextByte[portNumber] >= 0 ? 1 : 0);
+  readMIDI(portNumber);
+  return bufferSize[portNumber];
+}
+
+/**
+ * Return the next data byte for the port number
+ * @param portNumber
+ * @return the next byte or -1 if none
+ */
+int next(uint8_t portNumber) {
+  // The buffer is empty
+  if (available(portNumber) == 0) {
+    return -1;
+  }
+  return buffer[portNumber][bufferStartIndex[portNumber]];
+}
+
+/**
+ * Read one data byte from the port number
+ * @param portNumber
+ * @return the read byte or -1 if none
+ */
+int read(uint8_t portNumber) {
+  // The buffer is empty
+  if (available(portNumber) == 0) {
+    return -1;
+  }
+
+  // Get current start index and size
+  int& startIndex = bufferStartIndex[portNumber];
+  int& size = bufferSize[portNumber];
+
+  // Read the byte
+  int byte = buffer[portNumber][startIndex];
+
+  // Update start index and size
+  startIndex = (startIndex + 1) % FIFO_SIZE;
+  size--;
+
+  return byte;
 }
 
 /**
@@ -296,14 +334,20 @@ void processRealTimeMessage(uint8_t statusByte, uint8_t portNumber) {
 }
 
 /**
- * Forward real-time messages pending from all the input ports
+ * Forward real-time messages pending from all the input ports,
+ * regardless of their position in the queue
  */
 void mergeRealTimeMessages() {
-  for (byte portNumber = 0; portNumber < NUM_INPUT_PORTS; portNumber++) {
-    while (isRealTimeMessageType(next(portNumber))) {
-      int dataByte = read(portNumber);
-      processRealTimeMessage(dataByte, portNumber);
-      sendStatusByte(dataByte, portNumber);
+  for (uint8_t portNumber = 0; portNumber < NUM_INPUT_PORTS; portNumber++) {
+    if (available(portNumber) > 0) {
+      for (int index = 0; index < bufferSize[portNumber]; index++) {
+        int bufferIndex = (index + bufferStartIndex[portNumber]) % FIFO_SIZE;
+        int dataByte = buffer[portNumber][bufferIndex];
+        if (isRealTimeMessageType(dataByte)) {
+          sendStatusByte(dataByte, portNumber);
+          buffer[portNumber][bufferIndex] = -1;  // "delete" the read byte
+        }
+      }
     }
   }
 }
@@ -325,8 +369,8 @@ void mergeMIDI(uint8_t portNumber) {
 
   // It's a proper status byte
   if (isStatusByte(nextByte)) {
-    statusByte = nextByte;
-    sendStatusByte(read(portNumber), portNumber);
+    statusByte = read(portNumber);
+    sendStatusByte(statusByte, portNumber);
     processRealTimeMessage(statusByte, portNumber);
   }
   // Check if we have a valid running status for this port,
@@ -335,9 +379,12 @@ void mergeMIDI(uint8_t portNumber) {
     statusByte = runningStatus[portNumber];
     sendStatusByte(statusByte, portNumber);
   }
-  // This is an error: ignore it
+  // This is an error
   else {
-    read(portNumber);
+    // Read all the junk bytes until a proper status byte is encountered to try again in the next loop
+    while (available(portNumber) > 0 && !isStatusByte(next(portNumber))) {
+      read(portNumber);
+    }
     return;
   }
 
@@ -421,8 +468,9 @@ void reset() {
   lastSentStatusByte = 0x00;
   masterClockPort = PORT_NONE;
   activeSensingPort = PORT_NONE;
-  for (byte portNumber = 0; portNumber < NUM_INPUT_PORTS; portNumber++) {
-    nextByte[portNumber] = -1;
+  for (uint8_t portNumber = 0; portNumber < NUM_INPUT_PORTS; portNumber++) {
+    bufferStartIndex[portNumber] = 0;
+    bufferSize[portNumber] = 0;
     runningStatus[portNumber] = 0x00;
     songPosition[portNumber][0] = 0xFF;
     songPosition[portNumber][1] = 0xFF;
@@ -435,7 +483,7 @@ void reset() {
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   Serial1.begin(MIDI_BAUD_RATE);
-  for (byte portNumber = 0; portNumber < NUM_INPUT_PORTS; portNumber++) {
+  for (uint8_t portNumber = 0; portNumber < NUM_INPUT_PORTS; portNumber++) {
     getPort(portNumber).begin(MIDI_BAUD_RATE);
   }
   reset();
@@ -445,7 +493,7 @@ void setup() {
  * Main loop
  */
 void loop() {
-  for (byte portNumber = 0; portNumber < NUM_INPUT_PORTS; portNumber++) {
+  for (uint8_t portNumber = 0; portNumber < NUM_INPUT_PORTS; portNumber++) {
     mergeMIDI(portNumber);
   }
   handleActiveSensingTimeout();
