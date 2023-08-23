@@ -360,7 +360,8 @@ void mergeMIDI(uint8_t portNumber) {
   while (bytesLeft > 0 || isSysEx) {
     // Handle timeout
     if (micros() - lastReceivedTime > MIDI_RECEIVE_TIMEOUT) {
-      break;
+      handleLedOff();
+      return;
     }
 
     // Interleave real-time messages
@@ -369,6 +370,13 @@ void mergeMIDI(uint8_t portNumber) {
     // There is some data to read
     uint8_t dataByte;
     if (available(portNumber) > 0) {
+
+      // Terminate the current SysEx message if the next byte is a status byte
+      nextByte = next(portNumber);
+      if (isSysEx && isStatusByte(nextByte) && !isRealTimeMessageType(nextByte) && !isSystemExclusive(nextByte)) {
+        handleLedOff();
+        return;
+      }
 
       // Read and forward data byte
       dataByte = read(portNumber);
